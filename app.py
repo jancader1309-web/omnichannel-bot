@@ -245,7 +245,7 @@ def run_agent(sender_id: str, user_message: str) -> str:
 
     while True:
         response = anthropic_client.messages.create(
-            model="claude-sonnet-4-6-20250217",
+            model="claude-sonnet-4-6",
             max_tokens=1024,
             system=build_system_message(),
             tools=TOOLS,
