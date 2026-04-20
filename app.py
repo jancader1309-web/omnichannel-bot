@@ -1,5 +1,5 @@
 """
-Barber Shop AI Bot — bez n8n
+Barber Shop AI Bot
 Messenger + Claude AI + Google Calendar + Telegram powiadomienia
 """
 
@@ -8,6 +8,7 @@ import json
 import hashlib
 import hmac
 import logging
+import pickle
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import defaultdict
@@ -15,11 +16,9 @@ from collections import defaultdict
 import requests
 from flask import Flask, request, jsonify
 from anthropic import Anthropic
-from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-import pickle
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -38,7 +37,7 @@ conversation_history = defaultdict(list)
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
-def send_telegram_notification(text: str) -> None:
+def send_telegram_notification(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
@@ -52,6 +51,7 @@ def send_telegram_notification(text: str) -> None:
 
 
 CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
 
 def get_calendar_service():
     creds = None
@@ -73,8 +73,11 @@ def get_calendar_events(time_min, time_max):
     try:
         service = get_calendar_service()
         result = service.events().list(
-            calendarId="primary", timeMin=time_min, timeMax=time_max,
-            singleEvents=True, orderBy="startTime",
+            calendarId="primary",
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
         ).execute()
         formatted = []
         for e in result.get("items", []):
@@ -165,16 +168,16 @@ def handle_tool(name, inputs):
         result = create_calendar_event(inputs["summary"], inputs["start"], inputs["end"])
         if "error" in result:
             return "Blad tworzenia rezerwacji: " + result["error"]
-        from datetime import datetime
         dt = datetime.fromisoformat(inputs["start"])
         data_godz = dt.strftime("%d-%m-%Y, godz. %H:%M")
-        send_telegram_notification("🟢 Nowa rezerwacja!\n" + inputs["summary"] + "\n" + data_godz)
+        msg = "🟢 Nowa rezerwacja!\n" + inputs["summary"] + "\n" + data_godz
+        send_telegram_notification(msg)
         return "Rezerwacja utworzona. ID: " + result["id"]
 
     elif name == "delete_calendar_event":
         ok = delete_calendar_event(inputs["event_id"])
         if ok:
-            send_telegram_notification("Wizyta zostala odwolana przez klienta.")
+            send_telegram_notification("🔴 Wizyta zostala odwolana przez klienta.")
         return "Wizyta odwolana pomyslnie." if ok else "Nie udalo sie odwolac wizyty."
 
     return "Nieznane narzedzie: " + name
@@ -182,45 +185,42 @@ def handle_tool(name, inputs):
 
 def build_system_message():
     now = datetime.now(TIMEZONE)
-    days = "\n".join((now + timedelta(days=i)).strftime("%A %d %B %Y") for i in range(36))
-    return """Jestes asystentem Barber Shop Praga. Mow po polsku.
-
-SALON:
-Adres: ul. Zabkowska 38, Warszawa | Tel: 739-299-091
-Pon-Pt: 8-21 | Sob: 8-18 | Niedz: 9-15 (wybrane)
-
-CENNIK:
-Strzyzenie wlosow: 100 zl (40 min)
-Strzyzenie dlugich wlosow: 120 zl (60 min)
-Strzyzenie + broda: 160 zl (80 min)
-Strzyzenie brody: 80 zl (40 min)
-Golenie brody: 80 zl (40 min)
-Strzyzenie dzieci 3-11 lat: 100 zl (40 min)
-Modelowanie + mycie: 40 zl (10 min)
-Depilacja nosa/uszu: 30 zl (10 min)
-
-Dzisiaj i najblizsze 35 dni:
-""" + days + """
-
-REZERWACJA:
-1. Zbierz: imie i nazwisko, telefon, usluge, dzien i godzine
-2. Uzyj get_calendar_events — sprawdz czy termin wolny
-3. Powiedz: Rezerwuje: [dzien] [data] o [godzina] - [usluga]. Czy potwierdzasz?
-4. Po tak — uzyj create_calendar_event
-   Tytul: Wizyta - [Imie Nazwisko] - [usluga] - tel.[telefon]
-   Daty zawsze z +02:00, np. 2026-04-17T10:00:00+02:00
-5. Potwierdz klientowi
-
-ODWOLANIE:
-1. Zbierz: imie, telefon, date
-2. get_calendar_events — znajdz wizyte
-3. Sprawdz telefon w tytule — jesli pasuje uzyj delete_calendar_event
-
-WOLNE TERMINY:
-get_calendar_events na wybrany dzien — pokaz wolne sloty co 40 min
-
-FORMATOWANIE: Uzywaj emoji, unikaj gwiazdek i myslnikow.
-"""
+    days = "\n".join(
+        (now + timedelta(days=i)).strftime("%A %d %B %Y")
+        for i in range(36)
+    )
+    return (
+        "Jestes asystentem Barber Shop Praga. Mow po polsku.\n\n"
+        "SALON:\n"
+        "Adres: ul. Zabkowska 38, Warszawa | Tel: 739-299-091\n"
+        "Pon-Pt: 8-21 | Sob: 8-18 | Niedz: 9-15 (wybrane)\n\n"
+        "CENNIK:\n"
+        "Strzyzenie wlosow: 100 zl (40 min)\n"
+        "Strzyzenie dlugich wlosow: 120 zl (60 min)\n"
+        "Strzyzenie + broda: 160 zl (80 min)\n"
+        "Strzyzenie brody: 80 zl (40 min)\n"
+        "Golenie brody: 80 zl (40 min)\n"
+        "Strzyzenie dzieci 3-11 lat: 100 zl (40 min)\n"
+        "Modelowanie + mycie: 40 zl (10 min)\n"
+        "Depilacja nosa/uszu: 30 zl (10 min)\n\n"
+        "Dzisiaj i najblizsze 35 dni:\n"
+        + days +
+        "\n\nREZERWACJA:\n"
+        "1. Zbierz: imie i nazwisko, telefon, usluge, dzien i godzine\n"
+        "2. Uzyj get_calendar_events — sprawdz czy termin wolny\n"
+        "3. Powiedz: Rezerwuje: [dzien] [data] o [godzina] - [usluga]. Czy potwierdzasz?\n"
+        "4. Po tak — uzyj create_calendar_event\n"
+        "   Tytul: Wizyta - [Imie Nazwisko] - [usluga] - tel.[telefon]\n"
+        "   Daty zawsze z +02:00, np. 2026-04-17T10:00:00+02:00\n"
+        "5. Potwierdz klientowi\n\n"
+        "ODWOLANIE:\n"
+        "1. Zbierz: imie, telefon, date\n"
+        "2. get_calendar_events — znajdz wizyte\n"
+        "3. Sprawdz telefon w tytule — jesli pasuje uzyj delete_calendar_event\n\n"
+        "WOLNE TERMINY:\n"
+        "get_calendar_events na wybrany dzien — pokaz wolne sloty co 40 min\n\n"
+        "FORMATOWANIE: Uzywaj emoji, unikaj gwiazdek i myslnikow."
+    )
 
 
 def run_agent(sender_id, user_message):
@@ -269,7 +269,11 @@ def send_message(recipient_id, text):
         resp = requests.post(
             "https://graph.facebook.com/v25.0/me/messages",
             params={"access_token": PAGE_ACCESS_TOKEN},
-            json={"recipient": {"id": recipient_id}, "messaging_type": "RESPONSE", "message": {"text": chunk}},
+            json={
+                "recipient": {"id": recipient_id},
+                "messaging_type": "RESPONSE",
+                "message": {"text": chunk},
+            },
         )
         if resp.status_code != 200:
             logger.error(f"Blad wysylania: {resp.text}")
@@ -290,6 +294,7 @@ def handle_webhook():
     data = request.json
     if data.get("object") != "page":
         return "OK", 200
+
     for entry in data.get("entry", []):
         for messaging in entry.get("messaging", []):
             sender_id = messaging["sender"]["id"]
@@ -297,9 +302,10 @@ def handle_webhook():
             if not text:
                 continue
             logger.info(f"Wiadomosc od {sender_id}: {text}")
-                    send_message(sender_id, "⏳")
-                    reply = run_agent(sender_id, text)
-                    send_message(sender_id, reply)
+            send_message(sender_id, "⏳")
+            reply = run_agent(sender_id, text)
+            send_message(sender_id, reply)
+
     return "OK", 200
 
 
