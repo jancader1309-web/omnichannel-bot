@@ -165,8 +165,10 @@ def handle_tool(name, inputs):
         result = create_calendar_event(inputs["summary"], inputs["start"], inputs["end"])
         if "error" in result:
             return "Blad tworzenia rezerwacji: " + result["error"]
-        send_telegram_notification("Nowa rezerwacja!\n" + inputs["summary"] + "\n" + inputs["start"])
-        return "Rezerwacja utworzona. ID: " + result["id"]
+        from datetime import datetime
+dt = datetime.fromisoformat(inputs["start"])
+data_godz = dt.strftime("%d-%m-%Y, godz. %H:%M")
+send_telegram_notification("🟢 Nowa rezerwacja!\n" + inputs["summary"] + "\n" + data_godz)
 
     elif name == "delete_calendar_event":
         ok = delete_calendar_event(inputs["event_id"])
@@ -294,8 +296,9 @@ def handle_webhook():
             if not text:
                 continue
             logger.info(f"Wiadomosc od {sender_id}: {text}")
-            reply = run_agent(sender_id, text)
-            send_message(sender_id, reply)
+            send_message(sender_id, "⏳")
+reply = run_agent(sender_id, text)
+send_message(sender_id, reply)
     return "OK", 200
 
 
