@@ -1,6 +1,6 @@
 """
 Barber Shop AI Bot
-Messenger + Claude AI + Google Calendar + Telegram + Przypomnienia
+Messenger + Claude AI + Google Calendar + Google Sheets + Telegram + Przypomnienia + Opinie
 """
 
 import os
@@ -33,10 +33,14 @@ APP_SECRET         = os.environ["FB_APP_SECRET"]
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+SHEETS_ID          = os.environ.get("SHEETS_ID", "1WgecCrUjabsAS9KKLqV6UgxQMzsSPGGazD4DG8vmL1I")
 
 TIMEZONE = ZoneInfo("Europe/Warsaw")
 conversation_history = defaultdict(list)
+awaiting_review = {}  # sender_id -> {step, imie, usluga, barber, ocena}
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+
+BARBERS = ["Daria", "Bozena", "Ola"]
 
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
@@ -54,12 +58,15 @@ def send_telegram_notification(text):
         logger.error(f"Blad Telegram: {ex}")
 
 
-# ── Google Calendar ───────────────────────────────────────────────────────────
+# ── Google API ────────────────────────────────────────────────────────────────
 
-CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
 
 
-def get_calendar_service():
+def get_google_creds():
     creds = None
     if os.path.exists("token_calendar.pickle"):
         with open("token_calendar.pickle", "rb") as f:
@@ -68,12 +75,22 @@ def get_calendar_service():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", CALENDAR_SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
             creds = flow.run_local_server(port=0)
         with open("token_calendar.pickle", "wb") as f:
             pickle.dump(creds, f)
-    return build("calendar", "v3", credentials=creds)
+    return creds
 
+
+def get_calendar_service():
+    return build("calendar", "v3", credentials=get_google_creds())
+
+
+def get_sheets_service():
+    return build("sheets", "v4", credentials=get_google_creds())
+
+
+# ── Google Calendar ───────────────────────────────────────────────────────────
 
 def get_calendar_events(time_min, time_max):
     try:
@@ -123,10 +140,82 @@ def delete_calendar_event(event_id):
         return False
 
 
+# ── Google Sheets — Opinie ────────────────────────────────────────────────────
+
+def save_review(imie, usluga, barber, ocena, komentarz, messenger_id):
+    try:
+        service = get_sheets_service()
+        now = datetime.now(TIMEZONE).strftime("%d.%m.%Y %H:%M")
+        values = [[now, imie, usluga, barber, ocena, komentarz, messenger_id]]
+        service.spreadsheets().values().append(
+            spreadsheetId=SHEETS_ID,
+            range="A:G",
+            valueInputOption="RAW",
+            body={"values": values},
+        ).execute()
+        logger.info(f"Opinia zapisana: {imie} - {ocena}/5")
+        return True
+    except Exception as ex:
+        logger.error(f"Blad zapisu opinii: {ex}")
+        return False
+
+
+# ── Opinie — logika rozmowy ───────────────────────────────────────────────────
+
+def handle_review_flow(sender_id, text):
+    """Obsługuje rozmowę zbierania opinii — zwraca odpowiedź lub None jeśli nie dotyczy."""
+    state = awaiting_review.get(sender_id)
+    if not state:
+        return None
+
+    step = state.get("step")
+
+    if step == "ocena":
+        # Oczekujemy cyfry 1-5
+        ocena = text.strip()
+        if ocena not in ["1", "2", "3", "4", "5"]:
+            return "Prosze wpisz cyfre od 1 do 5 ⭐"
+        state["ocena"] = ocena
+        state["step"] = "komentarz"
+        awaiting_review[sender_id] = state
+        gwiazdki = "⭐" * int(ocena)
+        return f"Dziekujemy za ocene {gwiazdki}\n\nCzy chcesz dodac krotki komentarz? (napisz komentarz lub 'nie')"
+
+    elif step == "komentarz":
+        komentarz = "" if text.strip().lower() in ["nie", "no", "n"] else text.strip()
+        imie = state.get("imie", "")
+        usluga = state.get("usluga", "")
+        barber = state.get("barber", "")
+        ocena = state.get("ocena", "")
+
+        save_review(imie, usluga, barber, ocena, komentarz, sender_id)
+
+        # Powiadom wlasciciela
+        gwiazdki = "⭐" * int(ocena)
+        msg = f"Nowa opinia!\nKlient: {imie}\nBarber: {barber}\nUsluga: {usluga}\nOcena: {gwiazdki} ({ocena}/5)"
+        if komentarz:
+            msg += f"\nKomentarz: {komentarz}"
+        send_telegram_notification(msg)
+
+        del awaiting_review[sender_id]
+        return f"Dziekujemy za opinie! To dla nas bardzo wazne 🙏\nDo zobaczenia w Barber Shop Praga! ✂️"
+
+    return None
+
+
+def start_review(sender_id, imie, usluga, barber):
+    """Rozpoczyna zbieranie opinii dla klienta."""
+    awaiting_review[sender_id] = {
+        "step": "ocena",
+        "imie": imie,
+        "usluga": usluga,
+        "barber": barber,
+    }
+
+
 # ── Przypomnienia ─────────────────────────────────────────────────────────────
 
-def send_messenger_reminder(messenger_id, text):
-    """Wysyla przypomnienie do klienta przez Messenger."""
+def send_messenger_message_tagged(messenger_id, text):
     try:
         resp = requests.post(
             "https://graph.facebook.com/v25.0/me/messages",
@@ -140,23 +229,18 @@ def send_messenger_reminder(messenger_id, text):
             timeout=10,
         )
         if resp.status_code != 200:
-            logger.error(f"Blad przypomnienia Messenger: {resp.text}")
+            logger.error(f"Blad przypomnienia: {resp.text}")
     except Exception as ex:
-        logger.error(f"Blad wysylania przypomnienia: {ex}")
+        logger.error(f"Blad wysylania: {ex}")
 
 
 def send_reminders():
-    """Codziennie o 21:00 wysyla przypomnienia o jutrzejszych wizytach."""
     logger.info("Sprawdzam jutrzejsze wizyty...")
     now = datetime.now(TIMEZONE)
     tomorrow_start = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     tomorrow_end = tomorrow_start.replace(hour=23, minute=59, second=59)
 
-    events = get_calendar_events(
-        tomorrow_start.isoformat(),
-        tomorrow_end.isoformat(),
-    )
-
+    events = get_calendar_events(tomorrow_start.isoformat(), tomorrow_end.isoformat())
     if not events:
         logger.info("Brak wizyt na jutro.")
         return
@@ -165,15 +249,12 @@ def send_reminders():
         summary = event.get("summary", "")
         start = event.get("start", "")
 
-        # Wyciagnij Messenger ID z tytulu: mid.XXXXXXXXXX
         mid_match = re.search(r"mid\.(\d+)", summary)
         if not mid_match:
-            logger.info(f"Brak Messenger ID w: {summary}")
             continue
 
         messenger_id = mid_match.group(1)
 
-        # Formatuj godzine
         try:
             dt = datetime.fromisoformat(start)
             godz = dt.strftime("%H:%M")
@@ -182,24 +263,75 @@ def send_reminders():
             godz = start
             data = ""
 
-        # Wyciagnij imie z tytulu: Wizyta - Jan Kowalski - ...
         name_match = re.search(r"Wizyta - ([^-]+) -", summary)
         imie = name_match.group(1).strip() if name_match else "Kliencie"
 
-        # Wyciagnij usluge
         parts = summary.split(" - ")
         usluga = parts[2].strip() if len(parts) > 2 else "wizyta"
 
+        barber_match = re.search(r"barber\.([^-]+?)(?:\s*-|$)", summary)
+        barber = barber_match.group(1).strip() if barber_match else ""
+        barber_info = f"\nBarber: {barber}" if barber else ""
+
         reminder_text = (
-            f"Czesc {imie}! Przypominamy o jutrzejszej wizycie w Barber Shop Praga.\n\n"
+            f"Czesc {imie}! Przypominamy o jutrzejszej wizycie w Barber Shop Praga ✂️\n\n"
             f"Data: {data}\n"
             f"Godzina: {godz}\n"
-            f"Usluga: {usluga}\n\n"
+            f"Usluga: {usluga}"
+            f"{barber_info}\n\n"
             f"Do zobaczenia! Jezeli chcesz odwolac wizyte napisz do nas."
         )
 
-        send_messenger_reminder(messenger_id, reminder_text)
+        send_messenger_message_tagged(messenger_id, reminder_text)
         logger.info(f"Wyslano przypomnienie do {messenger_id}")
+
+
+def send_review_requests():
+    """Co 30 minut sprawdza wizyty ktore zakonczyly sie 30 min temu i wysyla prosbe o opinie."""
+    logger.info("Sprawdzam zakoncczone wizyty...")
+    now = datetime.now(TIMEZONE)
+    check_from = (now - timedelta(minutes=40)).isoformat()
+    check_to = (now - timedelta(minutes=20)).isoformat()
+
+    events = get_calendar_events(check_from, check_to)
+    for event in events:
+        summary = event.get("summary", "")
+        end_time = event.get("end", "")
+
+        mid_match = re.search(r"mid\.(\d+)", summary)
+        if not mid_match:
+            continue
+
+        messenger_id = mid_match.group(1)
+
+        # Nie wysylaj jesli juz zbieramy opinie
+        if messenger_id in awaiting_review:
+            continue
+
+        name_match = re.search(r"Wizyta - ([^-]+) -", summary)
+        imie = name_match.group(1).strip() if name_match else "Kliencie"
+
+        parts = summary.split(" - ")
+        usluga = parts[2].strip() if len(parts) > 2 else "wizyta"
+
+        barber_match = re.search(r"barber\.([^-]+?)(?:\s*-|$)", summary)
+        barber = barber_match.group(1).strip() if barber_match else "barber"
+
+        start_review(messenger_id, imie, usluga, barber)
+
+        review_text = (
+            f"Czesc {imie}! Dziekujemy za odwiedziny w Barber Shop Praga ✂️\n\n"
+            f"Jak oceniasz dzisiejsza wizyte?\n\n"
+            f"Wpisz cyfre od 1 do 5:\n"
+            f"1 ⭐ - Slabo\n"
+            f"2 ⭐⭐ - Ponizej oczekiwan\n"
+            f"3 ⭐⭐⭐ - Srednio\n"
+            f"4 ⭐⭐⭐⭐ - Dobrze\n"
+            f"5 ⭐⭐⭐⭐⭐ - Swietnie!"
+        )
+
+        send_messenger_message_tagged(messenger_id, review_text)
+        logger.info(f"Wyslano prosbe o opinie do {messenger_id}")
 
 
 # ── Narzędzia Claude ──────────────────────────────────────────────────────────
@@ -278,11 +410,13 @@ def build_system_message(sender_id=""):
         (now + timedelta(days=i)).strftime("%A %d %B %Y")
         for i in range(36)
     )
+    barbers_list = ", ".join(BARBERS)
     return (
         "Jestes asystentem Barber Shop Praga. Mow po polsku.\n\n"
         "SALON:\n"
         "Adres: ul. Zabkowska 38, Warszawa | Tel: 739-299-091\n"
         "Pon-Pt: 8-21 | Sob: 8-18 | Niedz: 9-15 (wybrane)\n\n"
+        f"BARBERZY: {barbers_list}\n\n"
         "CENNIK:\n"
         "Strzyzenie wlosow: 100 zl (40 min)\n"
         "Strzyzenie dlugich wlosow: 120 zl (60 min)\n"
@@ -296,12 +430,13 @@ def build_system_message(sender_id=""):
         + days +
         "\n\nREZERWACJA:\n"
         "1. Zbierz: imie i nazwisko, telefon, usluge, dzien i godzine\n"
-        "2. Uzyj get_calendar_events — sprawdz czy termin wolny\n"
-        "3. Powiedz: Rezerwuje: [dzien] [data] o [godzina] - [usluga]. Czy potwierdzasz?\n"
-        "4. Po tak — uzyj create_calendar_event z tytulem:\n"
-        f"   Wizyta - [Imie Nazwisko] - [usluga] - tel.[telefon] - mid.{sender_id}\n"
+        "2. Zapytaj ktory barber — do wyboru: " + barbers_list + " (lub 'bez preferencji')\n"
+        "3. Uzyj get_calendar_events — sprawdz czy termin wolny\n"
+        "4. Powiedz: Rezerwuje: [dzien] [data] o [godzina] - [usluga] - barber [imie]. Czy potwierdzasz?\n"
+        "5. Po tak — uzyj create_calendar_event z tytulem:\n"
+        f"   Wizyta - [Imie Nazwisko] - [usluga] - tel.[telefon] - barber.[imie barbera] - mid.{sender_id}\n"
         "   Daty zawsze z +02:00, np. 2026-04-17T10:00:00+02:00\n"
-        "5. Potwierdz klientowi\n\n"
+        "6. Potwierdz klientowi\n\n"
         "ODWOLANIE:\n"
         "1. Zbierz: imie, telefon, date\n"
         "2. get_calendar_events — znajdz wizyte\n"
@@ -396,7 +531,16 @@ def handle_webhook():
             text = messaging.get("message", {}).get("text", "")
             if not text:
                 continue
+
             logger.info(f"Wiadomosc od {sender_id}: {text}")
+
+            # Sprawdz czy klient jest w trakcie dawania opinii
+            review_reply = handle_review_flow(sender_id, text)
+            if review_reply:
+                send_message(sender_id, review_reply)
+                continue
+
+            # Normalny agent AI
             send_message(sender_id, "⏳")
             reply = run_agent(sender_id, text)
             send_message(sender_id, reply)
@@ -411,17 +555,23 @@ def health():
 
 @app.route("/test-reminders", methods=["GET"])
 def test_reminders():
-    """Endpoint do testowania przypomnien bez czekania do 21:00."""
     send_reminders()
-    return jsonify({"status": "done"})
+    return jsonify({"status": "reminders sent"})
+
+
+@app.route("/test-reviews", methods=["GET"])
+def test_reviews():
+    send_review_requests()
+    return jsonify({"status": "review requests sent"})
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 
 scheduler = BackgroundScheduler(timezone=TIMEZONE)
 scheduler.add_job(send_reminders, "cron", hour=21, minute=0)
+scheduler.add_job(send_review_requests, "interval", minutes=30)
 scheduler.start()
-logger.info("Scheduler uruchomiony — przypomnienia beda wysylane o 21:00.")
+logger.info("Scheduler uruchomiony.")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
