@@ -166,9 +166,10 @@ def handle_tool(name, inputs):
         if "error" in result:
             return "Blad tworzenia rezerwacji: " + result["error"]
         from datetime import datetime
-dt = datetime.fromisoformat(inputs["start"])
-data_godz = dt.strftime("%d-%m-%Y, godz. %H:%M")
-send_telegram_notification("🟢 Nowa rezerwacja!\n" + inputs["summary"] + "\n" + data_godz)
+        dt = datetime.fromisoformat(inputs["start"])
+        data_godz = dt.strftime("%d-%m-%Y, godz. %H:%M")
+        send_telegram_notification("🟢 Nowa rezerwacja!\n" + inputs["summary"] + "\n" + data_godz)
+        return "Rezerwacja utworzona. ID: " + result["id"]
 
     elif name == "delete_calendar_event":
         ok = delete_calendar_event(inputs["event_id"])
