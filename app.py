@@ -298,8 +298,8 @@ def handle_webhook():
                 continue
             logger.info(f"Wiadomosc od {sender_id}: {text}")
             send_message(sender_id, "⏳")
-reply = run_agent(sender_id, text)
-send_message(sender_id, reply)
+                    reply = run_agent(sender_id, text)
+                    send_message(sender_id, reply)
     return "OK", 200
 
 
