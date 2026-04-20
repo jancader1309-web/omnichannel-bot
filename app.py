@@ -1,9 +1,10 @@
 """
 Barber Shop AI Bot
-Messenger + Claude AI + Google Calendar + Telegram powiadomienia
+Messenger + Claude AI + Google Calendar + Telegram + Przypomnienia
 """
 
 import os
+import re
 import json
 import hashlib
 import hmac
@@ -19,6 +20,7 @@ from anthropic import Anthropic
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from apscheduler.schedulers.background import BackgroundScheduler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -37,6 +39,8 @@ conversation_history = defaultdict(list)
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
 
+# ── Telegram ──────────────────────────────────────────────────────────────────
+
 def send_telegram_notification(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -49,6 +53,8 @@ def send_telegram_notification(text):
     except Exception as ex:
         logger.error(f"Blad Telegram: {ex}")
 
+
+# ── Google Calendar ───────────────────────────────────────────────────────────
 
 CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
@@ -117,6 +123,87 @@ def delete_calendar_event(event_id):
         return False
 
 
+# ── Przypomnienia ─────────────────────────────────────────────────────────────
+
+def send_messenger_reminder(messenger_id, text):
+    """Wysyla przypomnienie do klienta przez Messenger."""
+    try:
+        resp = requests.post(
+            "https://graph.facebook.com/v25.0/me/messages",
+            params={"access_token": PAGE_ACCESS_TOKEN},
+            json={
+                "recipient": {"id": messenger_id},
+                "messaging_type": "MESSAGE_TAG",
+                "tag": "CONFIRMED_EVENT_UPDATE",
+                "message": {"text": text},
+            },
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.error(f"Blad przypomnienia Messenger: {resp.text}")
+    except Exception as ex:
+        logger.error(f"Blad wysylania przypomnienia: {ex}")
+
+
+def send_reminders():
+    """Codziennie o 21:00 wysyla przypomnienia o jutrzejszych wizytach."""
+    logger.info("Sprawdzam jutrzejsze wizyty...")
+    now = datetime.now(TIMEZONE)
+    tomorrow_start = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow_end = tomorrow_start.replace(hour=23, minute=59, second=59)
+
+    events = get_calendar_events(
+        tomorrow_start.isoformat(),
+        tomorrow_end.isoformat(),
+    )
+
+    if not events:
+        logger.info("Brak wizyt na jutro.")
+        return
+
+    for event in events:
+        summary = event.get("summary", "")
+        start = event.get("start", "")
+
+        # Wyciagnij Messenger ID z tytulu: mid.XXXXXXXXXX
+        mid_match = re.search(r"mid\.(\d+)", summary)
+        if not mid_match:
+            logger.info(f"Brak Messenger ID w: {summary}")
+            continue
+
+        messenger_id = mid_match.group(1)
+
+        # Formatuj godzine
+        try:
+            dt = datetime.fromisoformat(start)
+            godz = dt.strftime("%H:%M")
+            data = dt.strftime("%d.%m.%Y")
+        except Exception:
+            godz = start
+            data = ""
+
+        # Wyciagnij imie z tytulu: Wizyta - Jan Kowalski - ...
+        name_match = re.search(r"Wizyta - ([^-]+) -", summary)
+        imie = name_match.group(1).strip() if name_match else "Kliencie"
+
+        # Wyciagnij usluge
+        parts = summary.split(" - ")
+        usluga = parts[2].strip() if len(parts) > 2 else "wizyta"
+
+        reminder_text = (
+            f"Czesc {imie}! Przypominamy o jutrzejszej wizycie w Barber Shop Praga.\n\n"
+            f"Data: {data}\n"
+            f"Godzina: {godz}\n"
+            f"Usluga: {usluga}\n\n"
+            f"Do zobaczenia! Jezeli chcesz odwolac wizyte napisz do nas."
+        )
+
+        send_messenger_reminder(messenger_id, reminder_text)
+        logger.info(f"Wyslano przypomnienie do {messenger_id}")
+
+
+# ── Narzędzia Claude ──────────────────────────────────────────────────────────
+
 TOOLS = [
     {
         "name": "get_calendar_events",
@@ -136,7 +223,7 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "summary": {"type": "string", "description": "Tytul: Wizyta - Imie Nazwisko - usluga - tel.numer"},
+                "summary": {"type": "string", "description": "Tytul wizyty"},
                 "start": {"type": "string", "description": "Czas rozpoczecia ISO 8601 z +02:00"},
                 "end": {"type": "string", "description": "Czas zakonczenia ISO 8601 z +02:00"},
             },
@@ -157,7 +244,7 @@ TOOLS = [
 ]
 
 
-def handle_tool(name, inputs):
+def handle_tool(name, inputs, sender_id=""):
     if name == "get_calendar_events":
         events = get_calendar_events(inputs["time_min"], inputs["time_max"])
         if not events:
@@ -183,7 +270,9 @@ def handle_tool(name, inputs):
     return "Nieznane narzedzie: " + name
 
 
-def build_system_message():
+# ── System Message ────────────────────────────────────────────────────────────
+
+def build_system_message(sender_id=""):
     now = datetime.now(TIMEZONE)
     days = "\n".join(
         (now + timedelta(days=i)).strftime("%A %d %B %Y")
@@ -209,8 +298,8 @@ def build_system_message():
         "1. Zbierz: imie i nazwisko, telefon, usluge, dzien i godzine\n"
         "2. Uzyj get_calendar_events — sprawdz czy termin wolny\n"
         "3. Powiedz: Rezerwuje: [dzien] [data] o [godzina] - [usluga]. Czy potwierdzasz?\n"
-        "4. Po tak — uzyj create_calendar_event\n"
-        "   Tytul: Wizyta - [Imie Nazwisko] - [usluga] - tel.[telefon]\n"
+        "4. Po tak — uzyj create_calendar_event z tytulem:\n"
+        f"   Wizyta - [Imie Nazwisko] - [usluga] - tel.[telefon] - mid.{sender_id}\n"
         "   Daty zawsze z +02:00, np. 2026-04-17T10:00:00+02:00\n"
         "5. Potwierdz klientowi\n\n"
         "ODWOLANIE:\n"
@@ -223,6 +312,8 @@ def build_system_message():
     )
 
 
+# ── Agent Claude ──────────────────────────────────────────────────────────────
+
 def run_agent(sender_id, user_message):
     history = conversation_history[sender_id]
     history.append({"role": "user", "content": user_message})
@@ -234,7 +325,7 @@ def run_agent(sender_id, user_message):
         response = anthropic_client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=1024,
-            system=build_system_message(),
+            system=build_system_message(sender_id),
             tools=TOOLS,
             messages=history,
         )
@@ -252,7 +343,7 @@ def run_agent(sender_id, user_message):
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    result = handle_tool(block.name, block.input)
+                    result = handle_tool(block.name, block.input, sender_id)
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
@@ -262,6 +353,8 @@ def run_agent(sender_id, user_message):
         else:
             return "Przepraszam, wystapil blad."
 
+
+# ── Messenger ─────────────────────────────────────────────────────────────────
 
 def send_message(recipient_id, text):
     chunks = [text[i:i+1900] for i in range(0, len(text), 1900)]
@@ -278,6 +371,8 @@ def send_message(recipient_id, text):
         if resp.status_code != 200:
             logger.error(f"Blad wysylania: {resp.text}")
 
+
+# ── Endpointy Flask ───────────────────────────────────────────────────────────
 
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
@@ -313,6 +408,20 @@ def handle_webhook():
 def health():
     return jsonify({"status": "ok", "time": datetime.now(TIMEZONE).isoformat()})
 
+
+@app.route("/test-reminders", methods=["GET"])
+def test_reminders():
+    """Endpoint do testowania przypomnien bez czekania do 21:00."""
+    send_reminders()
+    return jsonify({"status": "done"})
+
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+
+scheduler = BackgroundScheduler(timezone=TIMEZONE)
+scheduler.add_job(send_reminders, "cron", hour=21, minute=0)
+scheduler.start()
+logger.info("Scheduler uruchomiony — przypomnienia beda wysylane o 21:00.")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
