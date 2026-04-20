@@ -297,7 +297,7 @@ def handle_webhook():
             if not text:
                 continue
             logger.info(f"Wiadomosc od {sender_id}: {text}")
-            send_message(sender_id, "⏳")
+                    send_message(sender_id, "⏳")
                     reply = run_agent(sender_id, text)
                     send_message(sender_id, reply)
     return "OK", 200
