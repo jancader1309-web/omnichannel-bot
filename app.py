@@ -444,7 +444,11 @@ def build_system_message(sender_id=""):
         "3. Sprawdz telefon w tytule — jesli pasuje uzyj delete_calendar_event\n\n"
         "WOLNE TERMINY:\n"
         "get_calendar_events na wybrany dzien — pokaz wolne sloty co 40 min\n\n"
-        "FORMATOWANIE: Uzywaj emoji, unikaj gwiazdek i myslnikow."
+        "FORMATOWANIE: Uzywaj emoji, unikaj gwiazdek i myslnikow.\n\n"
+        "PRZYCISKI — dodaj tag na koncu wiadomosci:\n"
+        "[PRZYCISKI:barber] — gdy pytasz ktory barber\n"
+        "[PRZYCISKI:potwierdzenie] — gdy proponujesz termin i czekasz na potwierdzenie\n"
+        "[PRZYCISKI:powitanie] — gdy uzytkownik pyta co mozesz zrobic lub na poczatku rozmowy"
     )
 
 
@@ -492,16 +496,71 @@ def run_agent(sender_id, user_message):
 
 # ── Messenger ─────────────────────────────────────────────────────────────────
 
-def send_message(recipient_id, text):
-    chunks = [text[i:i+1900] for i in range(0, len(text), 1900)]
-    for chunk in chunks:
+QUICK_REPLIES_MAP = {
+    "powitanie": [
+        {"content_type": "text", "title": "📅 Umów wizytę",      "payload": "UMOW_WIZYTE"},
+        {"content_type": "text", "title": "🕐 Wolne terminy",    "payload": "WOLNE_TERMINY"},
+        {"content_type": "text", "title": "❌ Odwołaj wizytę",   "payload": "ODWOLAJ_WIZYTE"},
+        {"content_type": "text", "title": "ℹ️ Pytanie",          "payload": "PYTANIE"},
+    ],
+    "barber": [
+        {"content_type": "text", "title": "Daria",              "payload": "BARBER_DARIA"},
+        {"content_type": "text", "title": "Bożena",             "payload": "BARBER_BOZENA"},
+        {"content_type": "text", "title": "Ola",                "payload": "BARBER_OLA"},
+        {"content_type": "text", "title": "Bez preferencji",    "payload": "BARBER_DOWOLNY"},
+    ],
+    "potwierdzenie": [
+        {"content_type": "text", "title": "✅ Tak, potwierdzam", "payload": "TAK"},
+        {"content_type": "text", "title": "❌ Nie, zmień termin","payload": "NIE"},
+    ],
+    "ocena": [
+        {"content_type": "text", "title": "⭐ 1",        "payload": "OCENA_1"},
+        {"content_type": "text", "title": "⭐⭐ 2",      "payload": "OCENA_2"},
+        {"content_type": "text", "title": "⭐⭐⭐ 3",    "payload": "OCENA_3"},
+        {"content_type": "text", "title": "⭐⭐⭐⭐ 4",  "payload": "OCENA_4"},
+        {"content_type": "text", "title": "⭐⭐⭐⭐⭐ 5","payload": "OCENA_5"},
+    ],
+}
+
+PAYLOAD_TO_TEXT = {
+    "UMOW_WIZYTE":    "Chcę umówić wizytę",
+    "WOLNE_TERMINY":  "Jakie są wolne terminy?",
+    "ODWOLAJ_WIZYTE": "Chcę odwołać wizytę",
+    "PYTANIE":        "Mam pytanie",
+    "BARBER_DARIA":   "Daria",
+    "BARBER_BOZENA":  "Bożena",
+    "BARBER_OLA":     "Ola",
+    "BARBER_DOWOLNY": "Bez preferencji",
+    "TAK":            "Tak, potwierdzam",
+    "NIE":            "Nie, zmień termin",
+    "OCENA_1": "1", "OCENA_2": "2", "OCENA_3": "3", "OCENA_4": "4", "OCENA_5": "5",
+}
+
+def detect_quick_replies(text):
+    match = re.search(r'\[PRZYCISKI:(\w+)\]', text)
+    if match:
+        tag = match.group(1)
+        clean = re.sub(r'\s*\[PRZYCISKI:\w+\]\s*', '', text).strip()
+        return clean, tag
+    return text, None
+
+def send_message(recipient_id, text, quick_reply_type=None):
+    clean_text, detected_type = detect_quick_replies(text)
+    qr_type = quick_reply_type or detected_type
+
+    chunks = [clean_text[i:i+1900] for i in range(0, len(clean_text), 1900)]
+    for i, chunk in enumerate(chunks):
+        message = {"text": chunk}
+        if qr_type and i == len(chunks) - 1 and qr_type in QUICK_REPLIES_MAP:
+            message["quick_replies"] = QUICK_REPLIES_MAP[qr_type]
+
         resp = requests.post(
             "https://graph.facebook.com/v25.0/me/messages",
             params={"access_token": PAGE_ACCESS_TOKEN},
             json={
                 "recipient": {"id": recipient_id},
                 "messaging_type": "RESPONSE",
-                "message": {"text": chunk},
+                "message": message,
             },
         )
         if resp.status_code != 200:
@@ -543,16 +602,35 @@ def handle_webhook():
                 if len(processed_messages) > 1000:
                     processed_messages.clear()
 
-            text = messaging.get("message", {}).get("text", "")
+            # Postback (klikniecie przycisku)
+            postback = messaging.get("postback", {})
+            if postback:
+                payload = postback.get("payload", "")
+                text = PAYLOAD_TO_TEXT.get(payload, payload)
+            else:
+                text = messaging.get("message", {}).get("text", "")
+
             if not text:
                 continue
 
             logger.info(f"Wiadomosc od {sender_id}: {text}")
 
+            # Powitanie przy pierwszej wiadomosci
+            if text.lower() in ["cześć", "czesc", "hej", "hello", "hi", "dzień dobry", "dzien dobry", "witaj"]:
+                send_message(
+                    sender_id,
+                    "Cześć! 👋 Witaj w Barber Shop Praga!\n\nJak mogę Ci pomóc? [PRZYCISKI:powitanie]"
+                )
+                continue
+
             # Sprawdz czy klient jest w trakcie dawania opinii
             review_reply = handle_review_flow(sender_id, text)
             if review_reply:
-                send_message(sender_id, review_reply)
+                # Przy pytaniu o ocene dodaj przyciski
+                if "wpisz cyfre od 1 do 5" in review_reply.lower() or "oceń" in review_reply.lower():
+                    send_message(sender_id, review_reply, quick_reply_type="ocena")
+                else:
+                    send_message(sender_id, review_reply)
                 continue
 
             # Normalny agent AI
