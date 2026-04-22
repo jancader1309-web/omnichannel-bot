@@ -39,6 +39,7 @@ TIMEZONE = ZoneInfo("Europe/Warsaw")
 conversation_history = defaultdict(list)
 awaiting_review = {}  # sender_id -> {step, imie, usluga, barber, ocena}
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+processed_messages = set()  # ochrona przed duplikatami
 
 BARBERS = ["Daria", "Bozena", "Ola"]
 
@@ -528,6 +529,20 @@ def handle_webhook():
     for entry in data.get("entry", []):
         for messaging in entry.get("messaging", []):
             sender_id = messaging["sender"]["id"]
+
+            # ignoruj echo (wiadomosci wysłane przez bota)
+            if messaging.get("message", {}).get("is_echo"):
+                continue
+
+            # ignoruj duplikaty
+            mid = messaging.get("message", {}).get("mid")
+            if mid and mid in processed_messages:
+                continue
+            if mid:
+                processed_messages.add(mid)
+                if len(processed_messages) > 1000:
+                    processed_messages.clear()
+
             text = messaging.get("message", {}).get("text", "")
             if not text:
                 continue
