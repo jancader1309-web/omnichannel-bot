@@ -34,6 +34,7 @@ ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 SHEETS_ID          = os.environ.get("SHEETS_ID", "1WgecCrUjabsAS9KKLqV6UgxQMzsSPGGazD4DG8vmL1I")
+IG_ACCESS_TOKEN    = os.environ.get("IG_ACCESS_TOKEN", "")
 
 TIMEZONE = ZoneInfo("Europe/Warsaw")
 conversation_history = defaultdict(list)
@@ -567,6 +568,26 @@ def send_message(recipient_id, text, quick_reply_type=None):
             logger.error(f"Blad wysylania: {resp.text}")
 
 
+# ── Instagram ────────────────────────────────────────────────────────────────
+
+def send_ig_message(recipient_id, text):
+    """Wysyła wiadomość przez Instagram API."""
+    clean_text, _ = detect_quick_replies(text)
+    chunks = [clean_text[i:i+1000] for i in range(0, len(clean_text), 1000)]
+    for chunk in chunks:
+        resp = requests.post(
+            "https://graph.facebook.com/v21.0/me/messages",
+            params={"access_token": IG_ACCESS_TOKEN},
+            json={
+                "recipient": {"id": recipient_id},
+                "messaging_type": "RESPONSE",
+                "message": {"text": chunk},
+            },
+        )
+        if resp.status_code != 200:
+            logger.error(f"Blad IG wysylania: {resp.text}")
+
+
 # ── Endpointy Flask ───────────────────────────────────────────────────────────
 
 @app.route("/webhook", methods=["GET"])
@@ -582,7 +603,38 @@ def verify_webhook():
 @app.route("/webhook", methods=["POST"])
 def handle_webhook():
     data = request.json
-    if data.get("object") != "page":
+    object_type = data.get("object")
+
+    # Instagram
+    if object_type == "instagram":
+        for entry in data.get("entry", []):
+            for messaging in entry.get("messaging", []):
+                sender_id = messaging["sender"]["id"]
+
+                if messaging.get("message", {}).get("is_echo"):
+                    continue
+
+                mid = messaging.get("message", {}).get("mid")
+                if mid and mid in processed_messages:
+                    continue
+                if mid:
+                    processed_messages.add(mid)
+                    if len(processed_messages) > 1000:
+                        processed_messages.clear()
+
+                text = messaging.get("message", {}).get("text", "")
+                if not text:
+                    continue
+
+                logger.info(f"[IG] Wiadomosc od {sender_id}: {text}")
+                send_ig_message(sender_id, "⏳")
+                reply = run_agent(sender_id, text)
+                send_ig_message(sender_id, reply)
+
+        return "OK", 200
+
+    # Facebook Messenger
+    if object_type != "page":
         return "OK", 200
 
     for entry in data.get("entry", []):
@@ -613,7 +665,7 @@ def handle_webhook():
             if not text:
                 continue
 
-            logger.info(f"Wiadomosc od {sender_id}: {text}")
+            logger.info(f"[FB] Wiadomosc od {sender_id}: {text}")
 
             # Powitanie przy pierwszej wiadomosci
             if text.lower() in ["cześć", "czesc", "hej", "hello", "hi", "dzień dobry", "dzien dobry", "witaj"]:
@@ -626,7 +678,6 @@ def handle_webhook():
             # Sprawdz czy klient jest w trakcie dawania opinii
             review_reply = handle_review_flow(sender_id, text)
             if review_reply:
-                # Przy pytaniu o ocene dodaj przyciski
                 if "wpisz cyfre od 1 do 5" in review_reply.lower() or "oceń" in review_reply.lower():
                     send_message(sender_id, review_reply, quick_reply_type="ocena")
                 else:
