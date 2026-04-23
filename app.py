@@ -692,6 +692,17 @@ def handle_webhook():
     return "OK", 200
 
 
+@app.route("/", methods=["GET"])
+def index():
+    return """<!DOCTYPE html>
+<html>
+<head>
+<meta name="facebook-domain-verification" content="ne5ku5b57wvp7gvw55axbwvs3ti1dx" />
+<title>BarberBot</title>
+</head>
+<body><h1>BarberBot API</h1></body>
+</html>"""
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "time": datetime.now(TIMEZONE).isoformat()})
